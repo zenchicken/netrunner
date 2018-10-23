@@ -4,7 +4,7 @@
             [game.macros :refer [effect req msg wait-for continue-ability]]
             [clojure.string :refer [split-lines split join lower-case includes? starts-with?]]
             [clojure.stacktrace :refer [print-stack-trace]]
-            [jinteki.utils :refer [str->int other-side]]
+            [jinteki.utils :refer [str->int other-side is-tagged? count-tags]]
             [jinteki.cards :refer [all-cards]]))
 
 ;;; Asset-specific helpers
@@ -534,7 +534,8 @@
                  :choices {:req #(and (is-type? % "Agenda")
                                       (or (in-hand? %)
                                           (in-discard? %)))}
-                 :msg (msg "reveal " (:title target)
+                 :label "Reveal an agenda from HQ or Archives"
+                 :msg (msg "reveal " (:title target) " from " (zone->name (:zone target))
                            (let [target-agenda-points (get-agenda-points state :corp target)]
                              (when (pos? target-agenda-points)
                                (str ", gain " target-agenda-points " [Credits], ")))
@@ -914,12 +915,10 @@
                                                       (in-hand? %))}
                                  :msg (msg "add " (:title target) " to score area")
                                  :async true
-                                 :effect (req (wait-for (as-agenda state :corp target (:agendapoints target))
-                                                        (let [latest (find-latest state target)]
-                                                          (when-let [events (:events (card-def latest))]
-                                                            (register-events state side events latest))
-                                                          (clear-wait-prompt state :runner)
-                                                          (effect-completed state side eid))))}
+                                 :effect (req (wait-for (as-agenda state :corp target (:agendapoints target)
+                                                                   {:register-events true})
+                                                        (clear-wait-prompt state :runner)
+                                                        (effect-completed state side eid)))}
                                 card nil))}]
     :events {:corp-turn-begins {:effect (effect (add-counter card :power 1))}}}
 
@@ -968,7 +967,7 @@
                  :prompt "Choose an operation to put on top of R&D"
                  :cost [:click 1]
                  :choices (req (cancellable (filter #(is-type? % "Operation") (:deck corp)) :sorted))
-                 :req (req (pos? (get-in @state [:runner :tag])))
+                 :req (req (pos? (get-in @state [:runner :tag :base])))
                  :effect (req (lose-tags state :corp 1)
                               (let [c (move state :corp target :play-area)]
                                 (shuffle! state :corp :deck)
@@ -992,15 +991,18 @@
 
    "Malia Z0L0K4"
    (let [re-enable-target (req (when-let [malia-target (:malia-target card)]
-                                 (system-msg state side (str "uses "  (:title card) " to unblank "
-                                                             (card-str state malia-target)))
-                                 (enable-card state :runner (get-card state malia-target))
-                                 (when-let [reactivate-effect (:reactivate (card-def malia-target))]
-                                   (resolve-ability state :runner reactivate-effect (get-card state malia-target) nil))))]
+                                 (when (:disabled (get-card state malia-target))
+                                   (system-msg state side (str "uses "  (:title card) " to unblank "
+                                                               (card-str state malia-target)))
+                                   (enable-card state :runner (get-card state malia-target))
+                                   (when-let [reactivate-effect (:reactivate (card-def malia-target))]
+                                     (resolve-ability state :runner reactivate-effect (get-card state malia-target) nil)))))]
      {:effect (effect (update! (assoc card :malia-target target))
                       (disable-card :runner target))
       :msg (msg (str "blank the text box of " (card-str state target)))
-      :choices {:req #(and (= (:side %) "Runner") (installed? %) (resource? %)
+      :choices {:req #(and (= "Runner" (:side %))
+                           (installed? %)
+                           (resource? %)
                            (not (has-subtype? % "Virtual")))}
       :leave-play re-enable-target
       :move-zone re-enable-target})
@@ -1939,7 +1941,7 @@
 
    "Watchdog"
    {:events {:pre-rez {:req (req (and (ice? target) (not (get-in @state [:per-turn (:cid card)]))))
-                       :effect (effect (rez-cost-bonus (- (:tag runner))))}
+                       :effect (effect (rez-cost-bonus (- (count-tags state))))}
              :rez {:req (req (and (ice? target) (not (get-in @state [:per-turn (:cid card)]))))
                               :effect (req (swap! state assoc-in [:per-turn (:cid card)] true))}}}
 

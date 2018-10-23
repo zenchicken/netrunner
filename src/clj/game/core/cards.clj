@@ -54,98 +54,141 @@
 (defn update!
   "Updates the state so that its copy of the given card matches the argument given."
   [state side {:keys [type zone cid host] :as card}]
-  (if (= type "Identity")
+  (cond
+    (= type "Identity")
     (when (= side (to-keyword (:side card)))
       (swap! state assoc-in [side :identity] card))
+
+    host
+    (update-hosted! state side card)
+
+    :else
+    (let [z (cons (to-keyword (or (get-scoring-owner state card) (:side card))) zone)
+              [head tail] (split-with #(not= (:cid %) cid) (get-in @state z))]
+          (when (not-empty tail)
+            (swap! state assoc-in z (vec (concat head [card] (rest tail))))))))
+
+;; Helpers for move
+(defn- remove-old-card
+  "Removes the old pre-move card from the game state, for use in move"
+  [state side {:keys [zone host] :as card}]
+  (doseq [s [:runner :corp]]
     (if host
-      (update-hosted! state side card)
-      (let [z (cons (to-keyword (or (get-scoring-owner state card) (:side card))) zone)
-            [head tail] (split-with #(not= (:cid %) cid) (get-in @state z))]
-        (when (not-empty tail)
-          (swap! state assoc-in z (vec (concat head [card] (rest tail)))))))))
+      (remove-from-host state side card)
+      (swap! state update-in (cons s (vec zone)) (fn [coll] (remove-once #(same-card? card %) coll))))))
+
+(defn- get-moved-card
+  "Get the moved cards with correct abilities and keys hooked up / removed etc."
+  [state side {:keys [zone host installed] :as card} to]
+  (let [zone (if host (map to-keyword (:zone host)) zone)
+        src-zone (first zone)
+        target-zone (if (vector? to) (first to) to)
+        same-zone? (= src-zone target-zone)
+        dest (if (sequential? to) (vec to) [to])
+        to-facedown (= dest [:rig :facedown])
+        to-installed (#{:servers :rig} (first dest))
+        trash-hosted (fn [h]
+                       (trash state side
+                              (update-in h [:zone] #(map to-keyword %))
+                              {:unpreventable true
+                               :suppress-event true
+                               ;; this handles executives getting trashed before World's Plaza #2949
+                               :host-trashed true})
+                       ())
+        update-hosted (fn [h]
+                        (let [newz (flatten (list dest))
+                              newh (-> h
+                                       (assoc-in [:zone] '(:onhost))
+                                       (assoc-in [:host :zone] newz))]
+                          (update! state side newh)
+                          (unregister-events state side h)
+                          (register-events state side (:events (card-def newh)) newh)
+                          newh))
+        hosted (seq (flatten (map (if same-zone? update-hosted trash-hosted) (:hosted card))))
+        ;; Set :seen correctly
+        c (if (= :corp side)
+            (cond
+              ;; Moving rezzed card to discard, explicitly mark as seen
+              (and (= :discard (first dest))
+                   (rezzed? card))
+              (assoc card :seen true)
+
+              ;; Moving card to HQ or R&D, explicitly mark as not seen
+              (#{:hand :deck} (first dest))
+              (dissoc card :seen)
+
+              ;; Else return card
+              :else
+              card)
+            card)
+        c (if (and (or installed
+                       host
+                       (#{:servers :scored :current} src-zone))
+                   (or (#{:hand :deck :discard :rfg} target-zone)
+                       to-facedown)
+                   (not (:facedown c)))
+            (deactivate state side c to-facedown)
+            c)
+        c (if to-installed
+            (assoc c :installed true)
+            (dissoc c :installed))
+        c (if to-facedown
+            (assoc c :facedown true)
+            (dissoc c :facedown))
+        moved-card (assoc c :zone dest
+                            :host nil
+                            :hosted hosted
+                            :previous-zone (:zone c))
+        ;; Set up abilities for stolen agendas
+        moved-card (if (and (= :scored (first dest))
+                            (card-flag? moved-card :has-abilities-when-stolen true))
+                     (merge moved-card {:abilities (:abilities (card-def moved-card))})
+                     moved-card)]
+    moved-card))
 
 (defn move
   "Moves the given card to the given new zone."
   ([state side card to] (move state side card to nil))
-  ([state side {:keys [zone cid host installed] :as card} to {:keys [front keep-server-alive force] :as options}]
-   (let [to (if (is-type? card "Fake-Identity") :rfg to)          ; Fake-Identities always get moved to RFG
-         zone (if host (map to-keyword (:zone host)) zone)
+  ([state side {:keys [zone host] :as card} to {:keys [front keep-server-alive force]}]
+   (let [zone (if host (map to-keyword (:zone host)) zone)
          src-zone (first zone)
-         target-zone (if (vector? to) (first to) to)
-         same-zone? (= src-zone target-zone)]
-     (when (and card (or host
-                         (some #(when (= cid (:cid %)) %) (get-in @state (cons :runner (vec zone))))
-                         (some #(when (= cid (:cid %)) %) (get-in @state (cons :corp (vec zone)))))
-                (or (empty? (get-in @state [side :locked (-> card :zone first)]))
-                    force))
-       (trigger-event state side :pre-card-moved card src-zone target-zone)
-       (let [dest (if (sequential? to) (vec to) [to])
-             to-facedown (= dest [:rig :facedown])
-             to-installed (#{:servers :rig} (first dest))
-             trash-hosted (fn [h]
-                             (trash state side
-                                    (update-in h [:zone] #(map to-keyword %))
-                                    {:unpreventable true
-                                     :suppress-event true
-                                     ;; this handles executives getting trashed before World's Plaza #2949
-                                     :host-trashed true})
-                               ())
-             update-hosted (fn [h]
-                             (let [newz (flatten (list (if (vector? to) to [to])))
-                                   newh (-> h
-                                      (assoc-in [:zone] '(:onhost))
-                                      (assoc-in [:host :zone] newz))]
-                               (update! state side newh)
-                               (unregister-events state side h)
-                               (register-events state side (:events (card-def newh)) newh)
-                               newh))
-             hosted (seq (flatten (map
-                      (if same-zone? update-hosted trash-hosted)
-                      (:hosted card))))
-             c (if (and (= side :corp)
-                        (= (first dest) :discard)
-                        (rezzed? card))
-                 (assoc card :seen true) card)
-             c (if (and (or installed host (#{:servers :scored :current} (first zone)))
-                        (or (#{:hand :deck :discard :rfg} (first dest)) to-facedown)
-                        (not (:facedown c)))
-                 (deactivate state side c to-facedown) c)
-             c (if to-installed (assoc c :installed true) (dissoc c :installed))
-             c (if to-facedown (assoc c :facedown true) (dissoc c :facedown))
-             moved-card (assoc c :zone dest :host nil :hosted hosted :previous-zone (:zone c))
-             moved-card (if (and (= side :corp)
-                                 (#{:hand :deck} (first dest)))
-                          (dissoc moved-card :seen)
-                          moved-card)
-             moved-card (if (and (= (first (:zone moved-card)) :scored)
-                                 (card-flag? moved-card :has-abilities-when-stolen true))
-                          (merge moved-card {:abilities (:abilities (card-def moved-card))}) moved-card)]
-         (doseq [s [:runner :corp]]
-           (if host
-             (remove-from-host state side card)
-             (swap! state update-in (cons s (vec zone)) (fn [coll] (remove-once #(= (:cid %) cid) coll)))))
-         (if front
-           (swap! state update-in (cons side dest) #(into [] (cons moved-card (vec %))))
-           (swap! state update-in (cons side dest) #(into [] (conj (vec %) moved-card))))
-         (let [z (vec (cons :corp (butlast zone)))]
-           (when (and (not keep-server-alive)
-                      (is-remote? z)
-                      (empty? (get-in @state (conj z :content)))
-                      (empty? (get-in @state (conj z :ices))))
-             (when-let [run (:run @state)]
-               (when (= (last (:server run)) (last z))
-                 (handle-end-run state side)))
-             (swap! state dissoc-in z)))
-         (when-let [card-moved (:move-zone (card-def c))]
-           (card-moved state side (make-eid state) moved-card card))
-         (trigger-event state side :card-moved card (assoc moved-card :move-to-side side))
-         ;; Default a card when moved to inactive zones (except :persistent key)
-         (when (#{:discard :hand :deck :rfg} to)
-           (reset-card state side moved-card)
-           (when-let [icon-card (get-in moved-card [:icon :card])]
-             ;; Remove icon and icon-card keys
-             (remove-icon state side icon-card moved-card)))
-         moved-card)))))
+         target-zone (if (vector? to) (first to) to)]
+     (if (is-type? card "Fake-Identity")
+       ;; Make Fake-Identity cards "disappear"
+       (do (deactivate state side card false)
+           (remove-old-card state side card))
+       (when (and card
+                  (or host
+                      (some #(same-card? card %) (get-in @state (cons :runner (vec zone))))
+                      (some #(same-card? card %) (get-in @state (cons :corp (vec zone)))))
+                  (or force
+                      (empty? (get-in @state [side :locked (-> card :zone first)]))))
+         (trigger-event state side :pre-card-moved card src-zone target-zone)
+         (let [dest (if (sequential? to) (vec to) [to])
+               moved-card (get-moved-card state side card to)]
+           (remove-old-card state side card)
+           (if front
+             (swap! state update-in (cons side dest) #(into [] (cons moved-card (vec %))))
+             (swap! state update-in (cons side dest) #(into [] (conj (vec %) moved-card))))
+           (let [z (vec (cons :corp (butlast zone)))]
+             (when (and (not keep-server-alive)
+                        (is-remote? z)
+                        (empty? (get-in @state (conj z :content)))
+                        (empty? (get-in @state (conj z :ices))))
+               (when-let [run (:run @state)]
+                 (when (= (last (:server run)) (last z))
+                   (handle-end-run state side)))
+               (swap! state dissoc-in z)))
+           (when-let [move-zone-fn (:move-zone (card-def moved-card))]
+             (move-zone-fn state side (make-eid state) moved-card card))
+           (trigger-event state side :card-moved card (assoc moved-card :move-to-side side))
+           ;; Default a card when moved to inactive zones (except :persistent key)
+           (when (#{:discard :hand :deck :rfg} to)
+             (reset-card state side moved-card)
+             (when-let [icon-card (get-in moved-card [:icon :card])]
+               ;; Remove icon and icon-card keys
+               (remove-icon state side icon-card moved-card)))
+           moved-card))))))
 
 (defn move-zone
   "Moves all cards from one zone to another, as in Chronos Project."
@@ -216,7 +259,7 @@
 
 (defn get-virus-counters
   "Calculate the number of virus counters on the given card, taking Hivemind into account."
-  [state side card]
+  [state card]
   (let [hiveminds (when (is-virus-program? card)
                     (filter #(= (:title %) "Hivemind") (all-active-installed state :runner)))]
     (reduce + (map #(get-counters % :virus) (cons card hiveminds)))))
@@ -235,7 +278,7 @@
 (defn disable-identity
   "Disables the side's identity"
   [state side]
-  (let [id (assoc (:identity (side @state)) :disabled true)]
+  (let [id (assoc (get-in @state [side :identity]) :disabled true)]
     (update! state side id)
     (unregister-events state side id)
     (when-let [leave-play (:leave-play (card-def id))]
@@ -244,19 +287,20 @@
 (defn disable-card
   "Disables a card"
   [state side card]
+  (deactivate state side card)
   (let [c (assoc card :disabled true)]
-    (deactivate state side card)
-    (update! state side c)))
+    (update! state side c))
+  (when-let [disable-effect (:disable (card-def card))]
+    (resolve-ability state side disable-effect (get-card state card) nil)))
 
 (defn enable-identity
   "Enables the side's identity"
   [state side]
-  (let [id (assoc (:identity (side @state)) :disabled false)
-        cdef (card-def id)
-        events (:events cdef)]
+  (let [id (assoc (get-in @state [side :identity]) :disabled false)
+        {:keys [events effect]} (card-def id)]
     (update! state side id)
-    (when-let [eff (:effect cdef)]
-      (eff state side (make-eid state) id nil))
+    (when effect
+      (effect state side (make-eid state) id nil))
     (when events
       (register-events state side events id))))
 

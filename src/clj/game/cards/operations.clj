@@ -4,7 +4,7 @@
             [game.macros :refer [effect req msg wait-for continue-ability]]
             [clojure.string :refer [split-lines split join lower-case includes? starts-with?]]
             [clojure.stacktrace :refer [print-stack-trace]]
-            [jinteki.utils :refer [str->int other-side]]
+            [jinteki.utils :refer [str->int other-side is-tagged? count-tags]]
             [jinteki.cards :refer [all-cards]]))
 
 (def card-definitions
@@ -203,7 +203,7 @@
    "Best Defense"
    {:async true
     :req (req (not-empty (all-installed state :runner)))
-    :effect (req (let [t (:tag runner)]
+    :effect (req (let [t (count-tags state)]
                    (continue-ability state side
                      {:prompt (msg "Choose a Runner card with an install cost of " t " or less to trash")
                       :choices {:req #(and (installed? %)
@@ -271,7 +271,7 @@
                     (draw eid 2 nil))}
 
    "BOOM!"
-   {:req (req (> (:tag runner) 1))
+   {:req (req (> (count-tags state) 1))
     :async true
     :msg "do 7 meat damage"
     :effect (effect (damage eid :meat 7 {:card card}))}
@@ -799,12 +799,11 @@
                                              card nil)))}
 
    "High-Profile Target"
-   (letfn [(dmg-count [runner]
-             (* 2 (:tag runner)))]
+   (letfn [(dmg-count [state] (* 2 (count-tags state)))]
      {:req (req tagged)
       :async true
-      :msg (msg "do " (dmg-count runner) " meat damage")
-      :effect (effect (damage eid :meat (dmg-count runner) {:card card}))})
+      :msg (msg "do " (dmg-count state) " meat damage")
+      :effect (effect (damage eid :meat (dmg-count state) {:card card}))})
 
    "Housekeeping"
    {:events {:runner-install {:player :runner
@@ -942,13 +941,13 @@
                                                    :effect (effect (gain-tags eid 1))}}}}}
 
    "Market Forces"
-   (letfn [(credit-diff [runner]
-             (min (* 3 (:tag runner))
-                  (:credit runner)))]
+   (letfn [(credit-diff [state]
+             (min (* 3 (count-tags state))
+                  (get-in @state [:runner :credit])))]
      {:req (req tagged)
-      :msg (msg (let [c (credit-diff runner)]
+      :msg (msg (let [c (credit-diff state)]
                   (str "make the runner lose " c " [Credits], and gain " c " [Credits]")))
-      :effect (req (let [c (credit-diff runner)]
+      :effect (req (let [c (credit-diff state)]
                      (lose-credits state :runner c)
                      (gain-credits state :corp c)))})
 
@@ -960,13 +959,18 @@
 
    "MCA Informant"
    {:implementation "Runner must deduct 1 click and 2 credits, then trash host manually"
-    :req (req (not-empty (filter #(has-subtype? % "Connection") (all-active-installed state :runner))))
+    :req (req (not-empty (filter #(has-subtype? % "Connection")
+                                 (all-active-installed state :runner))))
     :prompt "Choose a connection to host MCA Informant on it"
-    :choices {:req #(and (= (:side %) "Runner") (has-subtype? % "Connection") (installed? %))}
+    :choices {:req #(and (= (:side %) "Runner")
+                         (has-subtype? % "Connection")
+                         (installed? %))}
     :msg (msg "host it on " (card-str state target) ". The Runner has an additional tag")
     :effect (req (host state side (get-card state target) (assoc card :zone [:discard] :seen true))
-                 (swap! state update-in [:runner :tag] inc))
-    :leave-play (req (swap! state update-in [:runner :tag] dec)
+                 (swap! state update-in [:runner :tag :additional] inc)
+                 (trigger-event state :corp :runner-additional-tag-change 1))
+    :leave-play (req (swap! state update-in [:runner :tag :additional] dec)
+                     (trigger-event state :corp :runner-additional-tag-change 1)
                      (system-msg state :corp "trashes MCA Informant"))}
 
    "Medical Research Fundraiser"
@@ -1025,7 +1029,7 @@
                                  (system-msg state side (str "reveals " (clojure.string/join ", " titles) " from R&D")))
                                (if-let [ice (first r)]
                                  (let [newice (assoc ice :zone (:zone target) :rezzed true)
-                                       ices (get-in @state (cons :corp (:zone target)))
+                                       ices (get-in @state (cons :corp (:zone target)) [])
                                        newices (apply conj (subvec ices 0 i) newice (subvec ices i))]
                                    (swap! state assoc-in (cons :corp (:zone target)) newices)
                                    (swap! state update-in [:corp :deck] (fn [coll] (remove-once #(= (:cid %) (:cid newice)) coll)))
@@ -1063,7 +1067,7 @@
 
    "Observe and Destroy"
    {:additional-cost [:tag 1]
-    :req (req (and (pos? (:tag runner))
+    :req (req (and (pos? (count-tags state))
                    (< (:credit runner) 6)))
     :async true
     :effect (effect (continue-ability
@@ -1183,7 +1187,7 @@
     :choices :credit
     :prompt "How many credits?"
     :async true
-    :effect (req (let [c (min target (:tag runner))]
+    :effect (req (let [c (min target (count-tags state))]
                    (continue-ability state side
                                      {:msg (msg "place " c " advancement tokens on "
                                                 (card-str state target))
@@ -1423,18 +1427,16 @@
                                 :effect (effect (ice-strength-bonus (get-counters card :power) target))}}}
 
    "Sacrifice"
-   {:req (req (pos? (:bad-publicity corp)))
-    :async true
+   {:req (req (and (pos? (:bad-publicity corp))
+                   (some #(pos? (:agendapoints %)) (:scored corp))))
     :additional-cost [:forfeit]
-    :effect (effect (register-events (:events (card-def card))
-                                     (assoc card :zone '(:discard))))
-    :events {:corp-forfeit-agenda {:effect (req (let [bplost (min (:agendapoints (last (:rfg corp))) (:bad-publicity corp))]
-                                                  (if (not (neg? bplost)) (do (lose state side :bad-publicity bplost)
-                                                                              (gain-credits state side bplost)
-                                                                              (system-msg state side (str "uses Sacrifice to lose " bplost " bad publicity and gain " bplost " [Credits]")))
-                                                                          (system-msg state side "uses Sacrifice but gains no credits and loses no bad publicity"))
-                                                  (effect-completed state side eid)
-                                                  (unregister-events state side card)))}}}
+    :effect (req (let [bp-lost (max 0 (min (:agendapoints (last (:rfg corp)))
+                                           (:bad-publicity corp)))]
+                   (system-msg state side (str "uses Sacrifice to lose " bp-lost " bad publicity and gain " bp-lost " [Credits]"))
+                   (when (pos? bp-lost)
+                     (lose state side :bad-publicity bp-lost)
+                     (gain-credits state side bp-lost))))}
+
    "Salems Hospitality"
    {:prompt "Name a Runner card"
     :choices {:card-title (req (and (card-is? target :side "Runner")
@@ -1540,7 +1542,7 @@
 
    "Shoot the Moon"
    {:choices {:req #(and (ice? %) (not (rezzed? %)))
-              :max (req (min (:tag runner)
+              :max (req (min (count-tags state)
                              (reduce (fn [c server]
                                        (+ c (count (filter #(not (:rezzed %)) (:ices server)))))
                                      0 (flatten (seq (:servers corp))))))}
@@ -1758,16 +1760,11 @@
             :successful
             {:label "Give the Runner X tags"
              :async true
-             :effect (req (let [tags (-> @state :runner :tag)]
-                            (if (pos? tags)
-                              (do (gain-tags state :corp eid tags)
-                                  (system-msg
-                                    state side
-                                    (str "uses Threat Level Alpha to give the Runner " tags " tags")))
-                              (do (gain-tags state :corp eid 1)
-                                  (system-msg
-                                    state side
-                                    "uses Threat Level Alpha to give the Runner a tag")))))}}}
+             :effect (req (let [tags (max 1 (count-tags state))]
+                            (do (gain-tags state :corp eid tags)
+                                (system-msg
+                                  state side
+                                  (str "uses Threat Level Alpha to give the Runner " (quantify tags "tag"))))))}}}
 
    "Too Big to Fail"
    {:req (req (< (:credit corp) 10))
@@ -1776,7 +1773,7 @@
                     (gain-bad-publicity :corp 1))}
 
    "Traffic Accident"
-   {:req (req (>= (:tag runner) 2))
+   {:req (req (>= (count-tags state) 2))
     :msg "do 2 meat damage"
     :async true
     :effect (effect (damage eid :meat 2 {:card card}))}

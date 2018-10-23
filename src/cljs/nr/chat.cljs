@@ -10,13 +10,13 @@
             [nr.ws :as ws]
             [reagent.core :as r]))
 
-(declare fetch-messages)
-
 (defonce chat-state (atom {}))
 
 (def chat-channel (chan))
 (def delete-msg-channel (chan))
 (def delete-all-channel (chan))
+
+(go (swap! chat-state assoc :config (:json (<! (GET "/chat/config")))))
 
 (defn non-game-toast
   "Display a toast warning with the specified message."
@@ -121,15 +121,28 @@
           (swap! s assoc :msg "")
           (.focus input))))))
 
+(defn- illegal-message
+  [s]
+  (let [msg (:msg @s "")
+        msg-len (.-length msg)
+        max-len (get-in @chat-state [:config :max-length])]
+   (or (s/blank? msg)
+       (and max-len
+            (>= msg-len max-len)))))
+
 (defn msg-input-view [channel]
   (let [s (r/atom {})]
     (fn [channel]
       [:form.msg-box {:on-submit #(do (.preventDefault %)
-                                      (send-msg s channel))}
+                                      (when-not (illegal-message s)
+                                        (send-msg s channel)))}
        [:input {:type "text" :ref #(swap! chat-state assoc :msg-input %)
                 :placeholder "Say something...." :accessKey "l" :value (:msg @s)
                 :on-change #(swap! s assoc :msg (-> % .-target .-value))}]
-       [:button "Send"]])))
+       (let [disabled (illegal-message s)]
+         [:button {:disabled disabled
+                   :class (if disabled "disabled" "")}
+          "Send"])])))
 
 (defn channel-view [{:keys [channel active-channel]} s]
   [:div.block-link {:class (if (= active-channel channel) "active" "")
@@ -179,13 +192,11 @@
             (fn [i item]
               (when (not-empty item) (create-span item))) parts)))]]])))
 
-(defn fetch-messages [s]
-  (let [channel (:channel @s)
-        messages (get-in @app-state [:channels channel])]
-    (when (empty? messages)
-      (go (let [x (<! (GET (str "/messages/" (name channel))))
-                data (:json x)]
-            (update-message-channel channel data))))))
+(defn fetch-all-messages []
+  (doseq [channel (keys (:channels @app-state))]
+    (go (let [x (<! (GET (str "/messages/" (name channel))))
+              data (:json x)]
+          (update-message-channel channel data)))))
 
 (defn chat []
   (let [s (r/atom {:channel :general
@@ -201,14 +212,13 @@
 
        :component-will-mount
        (fn []
-         (fetch-messages s)
+         (fetch-all-messages)
          (go (while true
                (let [card (<! (:zoom-ch @s))]
                  (swap! s assoc :zoom card)))))
 
        :component-did-update
        (fn []
-         (fetch-messages s)
          (when-let [msg-list (:message-list @chat-state)]
            (let [curr-channel (:channel @s)
                  prev-channel (:prev-channel @old)

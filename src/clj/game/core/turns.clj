@@ -92,7 +92,8 @@
                 :click 0 :click-per-turn 4
                 :credit 5 :run-credit 0
                 :link 0
-                :tag 0 :tagged 0 :additional-tag 0
+                ;; is-tagged is a number in case there are multiple "runner is tagged" effects
+                :tag {:base 0 :additional 0 :is-tagged 0}
                 :memory {:base 4 :mod 0 :used 0}
                 :hand-size {:base 5 :mod 0}
                 :agenda-point 0 :agenda-point-req 7
@@ -131,8 +132,8 @@
 
 (defn reset-card
   "Resets a card back to its original state - retaining any data in the :persistent key"
-  ([state side card]
-   (update! state side (merge (make-card (get @all-cards (:title card)) (:cid card)) {:persistent card}))))
+  ([state side {:keys [title cid persistent]}]
+   (update! state side (assoc (make-card (get @all-cards title) cid) :persistent persistent))))
 
 (defn create-deck
   "Creates a shuffled draw deck (R&D/Stack) from the given list of cards.

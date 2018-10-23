@@ -3,15 +3,14 @@
   (:require [cljs.core.async :refer [chan put! <!] :as async]
             [clojure.string :refer [capitalize includes? join lower-case split]]
             [differ.core :as differ]
-            [jinteki.utils :refer [str->int]]
+            [jinteki.utils :refer [str->int is-tagged?] :as utils]
             [jinteki.cards :refer [all-cards]]
             [nr.appstate :refer [app-state]]
             [nr.auth :refer [avatar] :as auth]
             [nr.cardbrowser :refer [add-symbols] :as cb]
             [nr.utils :refer [influence-dot map-longest toastr-options]]
             [nr.ws :as ws]
-            [reagent.core :as r]
-            [jinteki.utils :as utils]))
+            [reagent.core :as r]))
 
 (defonce game-state (r/atom {}))
 (defonce last-state (atom {}))
@@ -1030,7 +1029,7 @@
   (let [me? (= (:side @game-state) :runner)]
     (fn [runner]
       (let [{:keys [user click credit run-credit memory link tag
-                    brain-damage agenda-point tagged hand-size active]} @runner]
+                    brain-damage agenda-point hand-size active]} @runner]
         [:div.panel.blue-shade.stats {:class (when active "active-player")}
          [:h4.ellipsis [avatar user {:opts {:size 22}}] (:username user)]
          [:div (str click " Click" (if (not= click 1) "s" ""))
@@ -1049,8 +1048,12 @@
          [:div (str agenda-point " Agenda Point"
                     (when (not= agenda-point 1) "s"))
           (when me? (controls :agenda-point))]
-         [:div (str tag " Tag" (if (not= tag 1) "s" ""))
-          (when (or (pos? tag) (pos? tagged)) [:div.warning "!"]) (when me? (controls :tag))]
+         (let [{:keys [base additional is-tagged]} tag
+               tag-count (+ base additional)
+               show-tagged (or (pos? tag-count) (pos? is-tagged))]
+           [:div (str base (when (pos? additional) (str " + " additional)) " Tag" (if (not= tag-count 1) "s" ""))
+            (when show-tagged [:div.warning "!"])
+            (when me? (controls :tag))])
          [:div (str brain-damage " Brain Damage")
           (when me? (controls :brain-damage))]
          (let [{:keys [base mod]} hand-size]
@@ -1349,9 +1352,8 @@
            [:br]
            [:button.win-right {:on-click #(swap! app-state assoc :start-shown true) :type "button"} "✘"]])))))
 
-(defn button-pane [{:keys [side active-player run end-turn runner-phase-12 corp-phase-12 corp runner me opponent] :as cursor}]
-  (let [s (r/atom {})
-        autocomp (r/track (fn [] (get-in @game-state [side :prompt 0 :choices :autocomplete])))
+(defn audio-component [{:keys [sfx] :as cursor}]
+    (let [s (r/atom {})
         audio-sfx (fn [name] (list (keyword name)
                                    (new js/Howl (clj->js {:src [(str "/sound/" name ".ogg")
                                                                 (str "/sound/" name ".mp3")]}))))
@@ -1372,6 +1374,19 @@
                                     (audio-sfx "run-successful")
                                     (audio-sfx "run-unsuccessful")
                                     (audio-sfx "virus-purge")))]
+        (r/create-class
+            {:display-name "audio-component"
+             :component-did-update
+             (fn []
+                 (update-audio (select-keys @game-state [:sfx :sfx-current-id :gameid]) soundbank))
+             :reagent-render
+             (fn [{:keys [sfx] :as cursor}]
+              (let [_ @sfx]))}))) ;; make this component rebuild when sfx changes.
+             
+
+(defn button-pane [{:keys [side active-player run end-turn runner-phase-12 corp-phase-12 corp runner me opponent] :as cursor}]
+  (let [s (r/atom {})
+        autocomp (r/track (fn [] (get-in @game-state [side :prompt 0 :choices :autocomplete])))]
     (r/create-class
       {:display-name "button-pane"
 
@@ -1387,9 +1402,7 @@
          (when (= "card-title" (get-in @game-state [side :prompt 0 :prompt-type]))
            (-> "#card-title" js/$ .focus))
          (doseq [{:keys [msg type options]} (get-in @game-state [side :toast])]
-           (toast msg type options))
-         (update-audio {:sfx (:sfx @game-state) :sfx-current-id (:sfx-current-id @game-state)
-                        :gameid (:gameid @game-state)} soundbank))
+           (toast msg type options)))
 
     :reagent-render
     (fn [{:keys [side active-player run end-turn runner-phase-12 corp-phase-12 corp runner me opponent] :as cursor}]
@@ -1514,7 +1527,7 @@
                [cond-button "Remove Tag"
                 (and (pos? (:click @me))
                      (>= (:credit @me) (- 2 (or (:tag-remove-bonus @me) 0)))
-                     (pos? (:tag @me)))
+                     (pos? (get-in @me [:tag :base])))
                 #(send-command "remove-tag")]
                [:div.run-button
                 [cond-button "Run" (and (pos? (:click @me))
@@ -1532,8 +1545,7 @@
             (when (= side :corp)
               [cond-button "Trash Resource" (and (pos? (:click @me))
                                                  (>= (:credit @me) (- 2 (or (:trash-cost-bonus @me) 0)))
-                                                 (or (pos? (:tagged @opponent))
-                                                     (pos? (:tag @opponent))))
+                                                 (is-tagged? game-state))
                #(send-command "trash-resource")])
             [cond-button "Draw" (and (pos? (:click @me)) (not-empty (:deck @me))) #(send-command "draw")]
             [cond-button "Gain Credit" (pos? (:click @me)) #(send-command "credit")]]))])})))
@@ -1583,7 +1595,8 @@
                  op-scored (r/cursor game-state [op-side :scored])
                  corp-servers (r/cursor game-state [:corp :servers])
                  corp-remotes (r/track (fn [] (get-remotes (get-in @game-state [:corp :servers]))))
-                 runner-rig (r/cursor game-state [:runner :rig])]
+                 runner-rig (r/cursor game-state [:runner :rig])
+                 sfx (r/cursor game-state [:sfx])]
              [:div.gameboard
 
               (let [me-keep (r/cursor game-state [me-side :keep])
@@ -1617,6 +1630,7 @@
                  (= @side :spectator) "opponent"]]
 
                [:div.inner-leftpane
+                [audio-component {:sfx sfx}]
 
                 [:div.left-inner-leftpane
                  [:div

@@ -4,7 +4,7 @@
             [game.macros :refer [effect req msg wait-for continue-ability]]
             [clojure.string :refer [split-lines split join lower-case includes? starts-with?]]
             [clojure.stacktrace :refer [print-stack-trace]]
-            [jinteki.utils :refer [str->int other-side]]
+            [jinteki.utils :refer [str->int other-side is-tagged? count-tags]]
             [jinteki.cards :refer [all-cards]]))
 
 (defn ice-boost-agenda [subtype]
@@ -471,8 +471,8 @@
    {:abilities [{:label "Gain 1 [Credit] for each Runner tag"
                  :cost [:click 1]
                  :once :per-turn
-                 :msg (msg "gain " (:tag runner) " [Credits]")
-                 :effect (effect (gain-credits (:tag runner)))}]}
+                 :msg (msg "gain " (count-tags state) " [Credits]")
+                 :effect (effect (gain-credits (count-tags state)))}]}
 
    "Executive Retreat"
    {:effect (effect (add-counter card :agenda 1)
@@ -787,7 +787,7 @@
    {:interactive (req true)
     :async true
     :prompt "Use Meteor Mining?"
-    :choices (req (if (< (:tag runner) 2)
+    :choices (req (if (< (count-tags state) 2)
                     ["Gain 7 [Credits]" "No action"]
                     ["Gain 7 [Credits]" "Do 7 meat damage" "No action"]))
     :effect (req (case target
@@ -1095,18 +1095,26 @@
    "Remote Enforcement"
    {:interactive (req true)
     :optional {:prompt "Search R&D for a piece of ice to install protecting a remote server?"
-               :yes-ability {:async true
-                             :prompt "Choose a piece of ice"
-                             :choices (req (filter ice? (:deck corp)))
-                             :effect (req (let [chosen-ice target]
-                                            (continue-ability state side
-                                              {:async true
-                                               :prompt (str "Select a server to install " (:title chosen-ice) " on")
-                                               :choices (filter #(not (#{"HQ" "Archives" "R&D"} %))
-                                                                (corp-install-list state chosen-ice))
-                                               :effect (effect (shuffle! :deck)
-                                                               (corp-install eid chosen-ice target {:install-state :rezzed-no-rez-cost}))}
-                                              card nil)))}}}
+               :yes-ability
+               {:async true
+                :effect (req (when (not-empty (filter ice? (:deck corp)))
+                               (continue-ability
+                                 state side
+                                 {:async true
+                                  :prompt "Choose a piece of ice"
+                                  :choices (req (filter ice? (:deck corp)))
+                                  :effect (req (let [chosen-ice target]
+                                                 (continue-ability
+                                                   state side
+                                                   {:async true
+                                                    :prompt (str "Select a server to install " (:title chosen-ice) " on")
+                                                    :choices (filter #(not (#{"HQ" "Archives" "R&D"} %))
+                                                                     (corp-install-list state chosen-ice))
+                                                    :effect (effect (shuffle! :deck)
+                                                                    (corp-install eid chosen-ice target
+                                                                                  {:install-state :rezzed-no-rez-cost}))}
+                                                   card nil)))}
+                                 card nil)))}}}
 
    "Research Grant"
    {:interactive (req true)

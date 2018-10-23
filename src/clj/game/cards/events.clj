@@ -4,7 +4,7 @@
             [game.macros :refer [effect req msg wait-for continue-ability]]
             [clojure.string :refer [split-lines split join lower-case includes? starts-with?]]
             [clojure.stacktrace :refer [print-stack-trace]]
-            [jinteki.utils :refer [str->int other-side]]
+            [jinteki.utils :refer [str->int other-side is-tagged? count-tags]]
             [jinteki.cards :refer [all-cards]]))
 
 (defn- run-event
@@ -22,13 +22,14 @@
           cdef)))
 
 (defn- cutlery
-  [subtype]
+  [_subtype]
   ;; Subtype does nothing currently, but might be used if trashing is properly implemented
   {:implementation "Ice trash is manual, always enables Reprisals"
-   :prompt "Choose a server"
-   :choices (req runnable-servers)
-   :effect (req (run state :runner target nil card)
-                (swap! state assoc-in [:runner :register :trashed-card] true))})
+   :async true
+   :effect (req (continue-ability state :runner
+                                  (run-event nil nil nil
+                                             (req (swap! state assoc-in [:runner :register :trashed-card] true)))
+                                  card nil))})
 
 (def card-definitions
   {"Account Siphon"
@@ -249,7 +250,7 @@
                    {:msg (msg "place 3 virus tokens on " (:title target))
                     :choices {:req #(and (installed? %)
                                          (= (:side %) "Runner")
-                                         (zero? (get-virus-counters state side %)))}
+                                         (zero? (get-virus-counters state %)))}
                     :effect (req (add-counter state :runner target :virus 3))}
                    card nil))}
 
@@ -522,9 +523,8 @@
                  {:end-run
                   {:async true
                    :effect
-                   (req (wait-for (do-access state side [:rd] {:no-root true})
-                                  (wait-for (do-access state side [:hq] {:no-root true})
-                                            (effect-completed state side eid))))}}
+                   (req (wait-for (do-access state side [:hq] {:no-root true})
+                                  (do-access state side eid [:rd] {:no-root true})))}}
                  card))}
 
    "Drive By"
@@ -900,7 +900,7 @@
    {:flags {:psi-prevent-spend (req 2)}}
 
    "Guinea Pig"
-   {:msg "trash all cards in the grip and gain 10 [credits]"
+   {:msg "trash all cards in the grip and gain 10 [Credits]"
     :effect (req (doseq [c (:hand runner)]
                    (trash state :runner c {:unpreventable true}))
                  (gain-credits state :runner 10))}
@@ -1125,17 +1125,16 @@
 
    "Itinerant Protesters"
    {:msg "reduce the Corp's maximum hand size by 1 for each bad publicity"
-    :effect (req (lose state :corp :hand-size {:mod  (:bad-publicity corp)})
+    :effect (req (change-hand-size state :corp (- (:bad-publicity corp)))
                  (add-watch state :itin
                    (fn [k ref old new]
                      (let [bpnew (get-in new [:corp :bad-publicity])
-                           bpold (get-in old [:corp :bad-publicity])]
-                       (when (> bpnew bpold)
-                         (lose state :corp :hand-size {:mod (- bpnew bpold)}))
-                       (when (< bpnew bpold)
-                         (gain state :corp :hand-size {:mod (- bpold bpnew)}))))))
+                           bpold (get-in old [:corp :bad-publicity])
+                           bpchange (- bpnew bpold)]
+                       (when-not (zero? bpchange)
+                         (change-hand-size state :corp (- bpchange)))))))
     :leave-play (req (remove-watch state :itin)
-                     (gain state :corp :hand-size {:mod (:bad-publicity corp)}))}
+                     (change-hand-size state :corp (:bad-publicity corp)))}
 
    "Knifed"
    (cutlery "Barrier")
@@ -1280,10 +1279,10 @@
    "Mars for Martians"
    {:msg (msg "draw " (count (filter #(and (has-subtype? % "Clan") (is-type? % "Resource"))
                                      (all-active-installed state :runner)))
-              " cards and gain " (:tag runner) " [Credits]")
+              " cards and gain " (count-tags state) " [Credits]")
     :effect (effect (draw (count (filter #(and (has-subtype? % "Clan") (is-type? % "Resource"))
                                          (all-active-installed state :runner))))
-                    (gain-credits (:tag runner)))}
+                    (gain-credits (count-tags state)))}
 
    "Mass Install"
    (let [mhelper (fn mi [n] {:prompt "Select a program to install"
@@ -1384,9 +1383,13 @@
                        :choices ["Gain 4 [Credits]" "Draw 4 cards"]
                        :effect (req (cond
                                       (= target "Gain 4 [Credits]")
-                                      (gain-credits state :runner 4)
+                                      (do
+                                        (system-msg state :runner (str "uses Office Supplies to gain 4 [Credits]"))
+                                        (gain-credits state :runner 4))
                                       (= target "Draw 4 cards")
-                                      (draw state :runner 4)))}
+                                      (do
+                                        (system-msg state :runner (str "uses Office Supplies to draw 4 cards"))
+                                        (draw state :runner 4))))}
                       card nil))}
 
    "On the Lam"
@@ -1572,24 +1575,25 @@
    "Rebirth"
    {:msg "change identities"
     :prompt "Choose an identity to become"
-    :choices (req (let [is-swappable (fn [c] (and (= "Identity" (:type c))
-                                             (= (-> @state :runner :identity :faction) (:faction c))
-                                             (not (.startsWith (:code c) "00")) ; only draft identities have this
-                                             (not (= (:title c) (-> @state :runner :identity :title)))))
+    :choices (req (let [is-draft-id? #(.startsWith (:code %) "00")
+                        runner-identity (:identity runner)
+                        is-swappable #(and (= "Identity" (:type %))
+                                           (= (:faction runner-identity) (:faction %))
+                                           (not (is-draft-id? %))
+                                           (not= (:title runner-identity) (:title %)))
                         swappable-ids (filter is-swappable (vals @all-cards))]
                     (cancellable swappable-ids :sorted)))
-
      :effect (req
-               ;; Handle Ayla - Part 1
-               (when (-> @state :runner :identity :code (= "13012"))
-                 (doseq [c (-> @state :runner :identity :hosted)]
-                   (move state side c :temp-nvram)))
+               (let [old-runner-identity (:identity runner)]
+                 ;; Handle hosted cards (Ayla) - Part 1
+                 (doseq [c (:hosted old-runner-identity)]
+                   (move state side c :temp-hosted))
 
-               (move state side (last (:discard runner)) :rfg)
-               (disable-identity state side)
+                 (move state side (last (:discard runner)) :rfg)
+                 (disable-identity state side)
 
-               ;; Manually reduce the runner's link by old link
-               (lose state :runner :link (get-in @state [:runner :identity :baselink]))
+                 ;; Manually reduce the runner's link by old link
+                 (lose state :runner :link (:baselink old-runner-identity)))
 
                ;; Move the selected ID to [:runner :identity] and set the zone
                (let [new-id (-> target :title server-card make-card (assoc :zone [:identity]))]
@@ -1597,10 +1601,10 @@
                  ;; enable-identity does not do everything that init-identity does
                  (init-identity state side new-id))
 
-               ;; Handle Ayla - Part 2
-               (when-not (empty? (-> @state :runner :temp-nvram))
-                 (doseq [c (-> @state :runner :temp-nvram)]
-                   (host state side (get-in @state [:runner :identity]) c {:facedown true}))))}
+               ;; Handle hosted cards (Ayla) - Part 2
+               (doseq [c (get-in @state [:runner :temp-hosted])]
+                 ;; Currently assumes all hosted cards are hosted facedown (Ayla)
+                 (host state side (get-in @state [:runner :identity]) c {:facedown true})))}
 
    "Reboot"
    (letfn [(install-cards [state side eid card to-install titles]

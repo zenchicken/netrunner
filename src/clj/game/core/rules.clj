@@ -12,12 +12,10 @@
   "Completes the play of the event / operation that the player can play for"
   [state side eid {:keys [title] :as card} cost-str ignore-cost]
   (let [c (move state side (assoc card :seen true) :play-area)
-        cdef (card-def card)]
-    (system-msg state side (str (if ignore-cost
-                                  "play "
-                                  (build-spend-msg cost-str "play"))
-                                title
-                                (when ignore-cost " at no cost")))
+        play-msg (if ignore-cost
+                   "play "
+                   (build-spend-msg cost-str "play"))]
+    (system-msg state side (str play-msg title (when ignore-cost " at no cost")))
     (play-sfx state side "play-instant")
     (if (has-subtype? c "Current")
       (do (doseq [s [:corp :runner]]
@@ -26,8 +24,10 @@
                 moved-card (move state side c :current)]
             (card-init state side eid moved-card {:resolve-effect true
                                                   :init-data true})))
-      (do (resolve-ability state side (assoc cdef :eid eid) card nil)
-          (when-let [c (some #(when (= (:cid %) (:cid card)) %) (get-in @state [side :play-area]))]
+      (do (let [ability (-> card card-def (dissoc :req) (assoc :eid eid))]
+            ;; Resolve ability, removing :req as that has already been checked.
+            (resolve-ability state side ability card nil))
+          (when-let [c (some #(when (same-card? card %) %) (get-in @state [side :play-area]))]
             (move state side c :discard))
           (when (has-subtype? card "Terminal")
             (lose state side :click (-> @state side :click))
@@ -43,32 +43,32 @@
   ([state side eid card {:keys [targets ignore-cost extra-cost no-additional-cost]}]
    (swap! state update-in [:bonus] dissoc :play-cost)
    (wait-for (trigger-event-simult state side :pre-play-instant nil card)
-             (when-not (seq (get-in @state [side :locked (-> card :zone first)]))
-               (let [cdef (card-def card)
+             (when (empty? (get-in @state [side :locked (-> card :zone first)]))
+               (let [{:keys [req additional-cost]} (card-def card)
                      additional-cost (if (has-subtype? card "Triple")
-                                       (concat (:additional-cost cdef) [:click 2])
-                                       (:additional-cost cdef))
+                                       (concat additional-cost [:click 2])
+                                       additional-cost)
                      additional-cost (if (and (has-subtype? card "Double")
                                               (not (get-in @state [side :register :double-ignore-additional])))
-                                       (concat (:additional-cost cdef) [:click 1])
+                                       (concat additional-cost [:click 1])
                                        additional-cost)
-                     additional-cost (if (and (has-subtype? card "Run")
-                                              (get-in @state [:bonus :run-cost]))
-                                       (concat additional-cost (get-in @state [:bonus :run-cost]))
+                     additional-cost (if-let [run-cost (and (has-subtype? card "Run")
+                                                            (get-in @state [:bonus :run-cost]))]
+                                       (concat additional-cost run-cost)
                                        additional-cost)
                      total-cost (play-cost state side card
                                            (concat (when-not no-additional-cost additional-cost) extra-cost
                                                    [:credit (:cost card)]))
                      eid (if-not eid (make-eid state) eid)]
                  ;; ensure the instant can be played
-                 (if (and (if-let [cdef-req (:req cdef)]
-                            (cdef-req state side eid card targets) true) ; req is satisfied
+                 (if (and (if req (req state side eid card targets) true) ; req is satisfied
                           (not (and (has-subtype? card "Current")
                                     (get-in @state [side :register :cannot-play-current])))
                           (not (and (has-subtype? card "Run")
                                     (not (can-run? state :runner))))
+                          ;; if priority, have not spent a click
                           (not (and (has-subtype? card "Priority")
-                                    (get-in @state [side :register :spent-click])))) ; if priority, have not spent a click
+                                    (get-in @state [side :register :spent-click]))))
                    ;; Wait on pay-sync to finish before triggering instant-effect
                    (wait-for (pay-sync state side card (if ignore-cost 0 total-cost) {:action :play-instant})
                              (if-let [cost-str async-result]
@@ -277,10 +277,12 @@
   [state side n]
   (swap! state update-in [:runner :tag-remove-bonus] (fnil #(+ % n) 0)))
 
-(defn resolve-tag [state side eid n args]
+(defn resolve-tag
+  "Resolve runner gain tags. Always gives `:base` tags."
+  [state side eid n _]
   (trigger-event state side :pre-resolve-tag n)
   (if (pos? n)
-    (do (gain state :runner :tag n)
+    (do (gain state :runner :tag {:base n})
         (toast state :runner (str "Took " (quantify n "tag") "!") "info")
         (trigger-event-sync state side eid :runner-gain-tag n))
     (effect-completed state side eid)))
@@ -317,14 +319,14 @@
        (resolve-tag state side eid n args)))))
 
 (defn lose-tags
+  "Always removes `:base` tags"
   ([state side n] (lose-tags state side (make-eid state) n))
   ([state side eid n]
    (if (= n :all)
-     (do (swap! state update-in [:stats :runner :lose :tag] (fnil + 0 0) (get-in @state [:runner :tag]))
-         (swap! state assoc-in [:runner :tag] 0))
+     (lose-tags state side eid (get-in @state [:runner :tag :base]))
      (do (swap! state update-in [:stats :runner :lose :tag] (fnil + 0) n)
-         (deduct state :runner [:tag n])))
-   (trigger-event-sync state side eid :runner-lose-tag n side)))
+         (deduct state :runner [:tag {:base n}])
+         (trigger-event-sync state side eid :runner-lose-tag n side)))))
 
 
 ;;;; Bad Publicity
@@ -349,7 +351,7 @@
     (effect-completed state side eid)))
 
 (defn gain-bad-publicity
-  "Attempts to give the runner n bad publicity, allowing for boosting/prevention effects."
+  "Attempts to give the corp n bad publicity, allowing for boosting/prevention effects."
   ([state side n] (gain-bad-publicity state side (make-eid state) n nil))
   ([state side eid n] (gain-bad-publicity state side eid n nil))
   ([state side eid n {:keys [unpreventable card] :as args}]
@@ -550,12 +552,16 @@
 
 (defn as-agenda
   "Adds the given card to the given side's :scored area as an agenda worth n points."
-  ([state side card n] (as-agenda state side (make-eid state) card n))
-  ([state side eid card n]
+  ([state side card n] (as-agenda state side (make-eid state) card n nil))
+  ([state side eid card n] (as-agenda state side eid card n nil))
+  ([state side eid card n {:keys [register-events]}]
    (move state side (assoc (deactivate state side card) :agendapoints n) :scored)
    (wait-for (trigger-event-sync state side :as-agenda (assoc card :as-agenda-side side :as-agenda-points n))
              (do (gain-agenda-point state side n)
-                 (effect-completed state side eid)))))
+                 (if register-events
+                   (wait-for (card-init state side (find-latest state card) {:resolve-effect false})
+                             (resolve-ability state side eid (:swapped (card-def card)) (find-latest state card) nil))
+                   (effect-completed state side eid))))))
 
 (defn forfeit
   "Forfeits the given agenda to the :rfg zone."
@@ -604,6 +610,11 @@
    (let [milltargets (take n (get-in @state [to-side :deck]))]
      (doseq [card milltargets]
        (trash-no-cost state from-side (make-eid state) card :seen false :unpreventable true)))))
+
+(defn change-hand-size
+  "Changes a side's hand-size modification by specified amount (positive or negative)"
+  [state side n]
+  (gain state side :hand-size {:mod n}))
 
 ;; Exposing
 (defn expose-prevent
