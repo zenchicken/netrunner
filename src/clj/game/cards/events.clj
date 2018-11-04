@@ -142,7 +142,7 @@
 
    "By Any Means"
    {:effect (effect (register-events (:events (card-def card))
-                                     (assoc card :zone '(:discard))))
+                                     (dissoc card :zone)))
     :events {:runner-turn-ends {:effect (effect (unregister-events card))}
              :access {:req (req (not= [:discard] (:zone target)))
                       :interactive (req true)
@@ -1154,6 +1154,30 @@
                                     (card-str state target))))}
                     card nil)))}
 
+   "Labor Rights"
+   {:req (req (pos? (+ (count (:deck runner)) (count (:discard runner)))))
+    :effect (req (let [mill-count (min 3 (count (:deck runner)))]
+                   (mill state :runner :runner mill-count)
+                   (system-msg state :runner (str "trashes the top " (quantify mill-count "card") " of their Stack"))
+                   (let [heap-count (min 3 (count (get-in @state [:runner :discard])))]
+                     (continue-ability
+                       state side
+                       {:prompt (str "Choose " (quantify heap-count "card") " to shuffle into the stack")
+                        :show-discard true
+                        :choices {:max heap-count
+                                  :all true
+                                  :not-self true
+                                  :req #(and (= (:side %) "Runner")
+                                             (in-discard? %))}
+                        :effect (req (doseq [c targets] (move state side c :deck))
+                                     (system-msg state :runner (str "shuffles " (join ", " (map :title targets))
+                                                                    " from their Heap into their Stack, and draws 1 card"))
+                                     (shuffle! state :runner :deck)
+                                     (draw state :runner 1)
+                                     (move state side (find-latest state card) :rfg)
+                                     (system-msg state :runner "removes Labor Rights from the game"))}
+                       card nil))))}
+
    "Lawyer Up"
    {:msg "remove 2 tags and draw 3 cards"
     :effect (effect (draw 3) (lose-tags 2))}
@@ -2048,6 +2072,28 @@
                                :effect (req (let [n (str->int target)]
                                               (when (pay state :runner card :click n)
                                                 (trash-cards state :corp (take n (shuffle (:hand corp)))))))}} card))}
+
+   "Watch the World Burn"
+   (letfn [(rfg-card-event [burn-name]
+             {:pre-access-card
+              {:req (req (= (:title target) burn-name))
+               :msg (msg (str "uses the previously played Watch the World Burn to remove " burn-name " from the game"))
+               :effect (req (move state :corp target :rfg))}})]
+     {:makes-run true
+      :prompt "Choose a server"
+      :choices (req (filter #(can-run-server? state %) remotes))
+      :effect (effect (run target nil card)
+                      (register-events (:events (card-def card))
+                                       (dissoc card :zone)))
+      :events {:pre-access-card {:req (req (and (not= (:type target) "Agenda")
+                                                (get-in @state [:run :successful])))
+                                 :once :per-run
+                                 :effect (req (let [t (:title target)]
+                                                (system-msg state :runner (str "to remove " t " from the game, and watch for other copies of " t " to burn"))
+                                                (move state :corp target :rfg)
+                                                ;; in the below, the new :cid ensures that when unregister-events is called, the rfg-card-event is left alone
+                                                (register-events state side (rfg-card-event t) (dissoc (assoc card :cid (make-cid)) :zone))))}
+               :run-ends {:effect (effect (unregister-events (dissoc card :zone)))}}})
 
    "White Hat"
    (letfn [(finish-choice [choices]
