@@ -9,7 +9,7 @@ RUN npm install -g bower stylus
 
 WORKDIR /netrunner
 COPY . .
-RUN bower --allow-root install
+RUN bower install
 RUN stylus src/css -o resources/public/css/
 RUN lein deps
 RUN lein cljsbuild once prod
