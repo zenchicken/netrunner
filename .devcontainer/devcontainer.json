@@ -1,0 +1,5 @@
+{
+  "name": "Jinteki.net",
+  "dockerComposeFile": "../docker/docker-compose.yml",
+  "service": "jnet"
+}
